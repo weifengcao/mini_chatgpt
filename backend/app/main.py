@@ -11,6 +11,7 @@ from app.seed import seed_demo_data
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    settings.validate_runtime_safety()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -59,10 +59,14 @@ function parseSse(buffer: string): { events: SseEvent[]; rest: string } {
       const eventLine = chunk.split('\n').find((line) => line.startsWith('event:'));
       const dataLine = chunk.split('\n').find((line) => line.startsWith('data:'));
       if (!eventLine || !dataLine) return null;
-      return {
-        event: eventLine.replace('event:', '').trim(),
-        data: JSON.parse(dataLine.replace('data:', '').trim())
-      };
+      try {
+        return {
+          event: eventLine.replace('event:', '').trim(),
+          data: JSON.parse(dataLine.replace('data:', '').trim())
+        };
+      } catch {
+        return null;
+      }
     })
     .filter(Boolean) as SseEvent[];
   return { events, rest };
@@ -166,65 +170,83 @@ function App() {
     const content = draft.trim();
     setDraft('');
     const optimisticId = `local-${crypto.randomUUID()}`;
+    const optimisticAssistantId = `assistant-${optimisticId}`;
+    const rollbackOptimistic = () => {
+      setMessages((items) => items.filter((message) => message.id !== optimisticId && message.id !== optimisticAssistantId));
+    };
     setMessages((items) => [
       ...items,
       { id: optimisticId, user_id: user?.id || null, role: 'user', content, status: 'complete', sequence_number: items.length + 1 },
-      { id: `assistant-${optimisticId}`, user_id: null, role: 'assistant', content: '', status: 'streaming', sequence_number: items.length + 2 }
+      { id: optimisticAssistantId, user_id: null, role: 'assistant', content: '', status: 'streaming', sequence_number: items.length + 2 }
     ]);
 
-    const response = await fetch(`${API_BASE}/api/chat-sessions/${activeSession.id}/messages/stream`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-        'Idempotency-Key': crypto.randomUUID()
-      },
-      body: JSON.stringify({ content })
-    });
-    if (!response.ok || !response.body) {
-      setBusy(false);
-      setError(await response.text());
-      return;
-    }
+    let sawServerMessage = false;
+    try {
+      const response = await fetch(`${API_BASE}/api/chat-sessions/${activeSession.id}/messages/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          'Idempotency-Key': crypto.randomUUID()
+        },
+        body: JSON.stringify({ content })
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(await response.text() || response.statusText);
+      }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let rest = '';
-    let assistantId = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const parsed = parseSse(rest + decoder.decode(value, { stream: true }));
-      rest = parsed.rest;
-      for (const item of parsed.events) {
-        if (item.event === 'message_started') {
-          assistantId = String(item.data.message_id || '');
-        }
-        if (item.event === 'token') {
-          const text = String(item.data.text || '');
-          setMessages((items) => {
-            const copy = [...items];
-            const targetIndex = copy.findIndex((message) => message.id === `assistant-${optimisticId}`);
-            if (targetIndex >= 0) {
-              copy[targetIndex] = {
-                ...copy[targetIndex],
-                id: assistantId || copy[targetIndex].id,
-                content: copy[targetIndex].content + text
-              };
-            }
-            return copy;
-          });
-        }
-        if (item.event === 'error') {
-          setError(String(item.data.message || item.data.code || 'Request failed'));
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let rest = '';
+      let assistantId = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const parsed = parseSse(rest + decoder.decode(value, { stream: true }));
+        rest = parsed.rest;
+        for (const item of parsed.events) {
+          if (item.event === 'message_started') {
+            sawServerMessage = true;
+            assistantId = String(item.data.message_id || '');
+          }
+          if (item.event === 'token') {
+            const text = String(item.data.text || '');
+            setMessages((items) => {
+              const copy = [...items];
+              const targetIndex = copy.findIndex((message) => message.id === optimisticAssistantId);
+              if (targetIndex >= 0) {
+                copy[targetIndex] = {
+                  ...copy[targetIndex],
+                  id: assistantId || copy[targetIndex].id,
+                  content: copy[targetIndex].content + text
+                };
+              }
+              return copy;
+            });
+          }
+          if (item.event === 'error') {
+            setError(String(item.data.message || item.data.code || 'Request failed'));
+          }
         }
       }
+
+      await Promise.all([
+        api<Message[]>(`/api/chat-sessions/${activeSession.id}/messages`).then(setMessages),
+        api<AgentRun[]>('/api/agent-runs').then(setRuns)
+      ]);
+    } catch (err) {
+      if (sawServerMessage) {
+        await Promise.allSettled([
+          api<Message[]>(`/api/chat-sessions/${activeSession.id}/messages`).then(setMessages),
+          api<AgentRun[]>('/api/agent-runs').then(setRuns)
+        ]);
+      } else {
+        rollbackOptimistic();
+      }
+      setError(err instanceof Error ? err.message : 'Request failed');
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
-    await Promise.all([
-      api<Message[]>(`/api/chat-sessions/${activeSession.id}/messages`).then(setMessages),
-      api<AgentRun[]>('/api/agent-runs').then(setRuns)
-    ]);
   }
 
   if (!token) {

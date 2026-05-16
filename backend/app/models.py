@@ -30,7 +30,7 @@ class Company(Base):
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (UniqueConstraint("company_id", "email", name="uq_users_company_email"),)
+    __table_args__ = (UniqueConstraint("email", name="uq_users_email"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("usr"))
     company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), nullable=False)

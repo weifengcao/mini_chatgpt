@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.deps import get_current_user, require_admin
-from app.models import Agent, AgentRun, AgentRunEvidence, AgentStepRun, ChatSession, Message, User
+from app.models import Agent, AgentAccessAssignment, AgentRun, AgentRunEvidence, AgentStepRun, ChatSession, Message, User
 from app.schemas import (
     AgentRunOut,
     AgentStepOut,
@@ -27,6 +27,7 @@ from app.services import (
     stream_agent_run,
     stream_existing,
     touch_participant,
+    user_can_access_agent,
 )
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -145,6 +146,12 @@ async def create_message_non_streaming(
 @router.get("/agent-runs", response_model=list[AgentRunOut])
 def list_agent_runs(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[AgentRun]:
     query = select(AgentRun).where(AgentRun.company_id == user.company_id).order_by(AgentRun.created_at.desc())
+    if user.role != "SUPER_ADMIN":
+        allowed_agent_ids = select(AgentAccessAssignment.agent_id).where(
+            AgentAccessAssignment.company_id == user.company_id,
+            AgentAccessAssignment.user_id == user.id,
+        )
+        query = query.where(AgentRun.agent_id.in_(allowed_agent_ids))
     return list(db.scalars(query.limit(100)))
 
 
@@ -153,6 +160,8 @@ def get_agent_run(run_id: str, db: Session = Depends(get_db), user: User = Depen
     run = db.get(AgentRun, run_id)
     if run is None or run.company_id != user.company_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
+    if not user_can_access_agent(db, user, run.agent_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent access required")
     return run
 
 

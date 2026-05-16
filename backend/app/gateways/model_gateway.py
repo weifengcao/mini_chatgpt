@@ -27,10 +27,14 @@ class ModelGateway:
         provider: str | None = None,
     ) -> AsyncIterator[str]:
         selected_provider = (provider or self.settings.ai_provider).lower()
-        if selected_provider == "nvidia" and self.settings.nvidia_api_key:
+        if selected_provider == "nvidia":
+            if not self.settings.nvidia_api_key:
+                raise ModelGatewayConfigurationError("NVIDIA_API_KEY is required when AI provider is nvidia")
             async for token in self._stream_nvidia(messages, model_name or self.settings.ai_model):
                 yield token
             return
+        if selected_provider != "fake":
+            raise ModelGatewayConfigurationError(f"Unsupported AI provider: {selected_provider}")
 
         async for token in self._stream_fake(messages):
             yield token
@@ -78,3 +82,7 @@ class ModelGateway:
                     text = delta.get("content")
                     if text:
                         yield text
+
+
+class ModelGatewayConfigurationError(Exception):
+    code = "MODEL_GATEWAY_CONFIGURATION_ERROR"

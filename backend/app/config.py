@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
+    def validate_runtime_safety(self) -> None:
+        if self.app_env.lower() in {"local", "test"}:
+            return
+        if self.app_secret_key == "change-me" or len(self.app_secret_key) < 32:
+            raise RuntimeError("APP_SECRET_KEY must be changed for non-local environments")
+        if self.seed_demo_data:
+            raise RuntimeError("SEED_DEMO_DATA must be disabled for non-local environments")
+
 
 @lru_cache
 def get_settings() -> Settings:

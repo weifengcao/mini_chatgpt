@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -33,6 +34,10 @@ from app.models import (
 
 class AgentLoopLimitError(Exception):
     code = "AGENT_LOOP_LIMIT_EXCEEDED"
+
+
+class AgentRunTimeoutError(Exception):
+    code = "AGENT_RUN_TIMED_OUT"
 
 
 def request_hash(content: str) -> str:
@@ -182,6 +187,79 @@ def loop_limits(settings: Settings, agent: Agent) -> dict[str, int]:
     return limits
 
 
+def _as_utc(value: datetime | None) -> datetime:
+    if value is None:
+        return utcnow()
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _run_timeout_seconds(run: AgentRun, fallback: int) -> int:
+    return int((run.loop_limits_json or {}).get("max_run_duration_seconds") or fallback)
+
+
+def _run_is_expired(run: AgentRun, fallback_timeout_seconds: int) -> bool:
+    timeout_seconds = _run_timeout_seconds(run, fallback_timeout_seconds)
+    if timeout_seconds <= 0:
+        return False
+    started_at = _as_utc(run.started_at or run.created_at)
+    return utcnow() >= started_at + timedelta(seconds=timeout_seconds)
+
+
+def _raise_if_run_expired(run: AgentRun) -> None:
+    if _run_is_expired(run, 0):
+        raise AgentRunTimeoutError("Agent run exceeded max duration")
+
+
+def _mark_run_interrupted(
+    db: Session,
+    run: AgentRun,
+    assistant_message: Message | None,
+    code: str,
+    output_summary: str,
+) -> None:
+    has_content = bool(assistant_message and assistant_message.content)
+    if assistant_message is not None:
+        assistant_message.status = "partial" if has_content else "failed"
+        assistant_message.error_code = code
+    run.status = "partial" if has_content else "failed"
+    run.error_code = code
+    run.completed_at = utcnow()
+    run.metrics_json = {**(run.metrics_json or {}), "completed": False}
+    try:
+        create_step(db, run, "error", status_value="failed", output_summary=output_summary, error_code=code)
+    except AgentLoopLimitError:
+        pass
+
+
+def expire_stale_running_runs(db: Session, settings: Settings, company_id: str, session_id: str) -> None:
+    running_runs = list(
+        db.scalars(
+            select(AgentRun).where(
+                AgentRun.company_id == company_id,
+                AgentRun.session_id == session_id,
+                AgentRun.status == "running",
+            )
+        )
+    )
+    expired = False
+    for run in running_runs:
+        if not _run_is_expired(run, settings.agent_max_run_duration_seconds):
+            continue
+        assistant_message = db.get(Message, run.assistant_message_id) if run.assistant_message_id else None
+        _mark_run_interrupted(
+            db,
+            run,
+            assistant_message,
+            "AGENT_RUN_TIMED_OUT",
+            "Agent run exceeded max duration and was recovered before a new send.",
+        )
+        expired = True
+    if expired:
+        db.commit()
+
+
 def prepare_chat_run(
     db: Session,
     settings: Settings,
@@ -192,6 +270,7 @@ def prepare_chat_run(
 ) -> tuple[ChatSession, Agent, Message, Message, AgentRun, bool]:
     session, agent = require_session_access(db, user, session_id)
     touch_participant(db, settings, user, session)
+    expire_stale_running_runs(db, settings, user.company_id, session_id)
 
     hashed = request_hash(content)
     existing_message = db.scalar(
@@ -314,10 +393,11 @@ async def stream_agent_run(
 ) -> AsyncIterator[str]:
     model_gateway = ModelGateway(settings)
     tool_gateway = ToolGateway()
-    yield sse_event("message_started", {"message_id": assistant_message.id, "agent_run_id": run.id})
-    yield sse_event("agent_run_started", {"agent_run_id": run.id, "message_id": assistant_message.id})
 
     try:
+        yield sse_event("message_started", {"message_id": assistant_message.id, "agent_run_id": run.id})
+        yield sse_event("agent_run_started", {"agent_run_id": run.id, "message_id": assistant_message.id})
+
         context_step = create_step(
             db,
             run,
@@ -327,6 +407,7 @@ async def stream_agent_run(
         )
         create_evidence(db, run, "user_message", "message", user_message.id, user_message.content, context_step)
         db.commit()
+        _raise_if_run_expired(run)
 
         expression = find_calculator_expression(user_message.content)
         if expression and "calculator" in (agent.tool_allowlist_json or []):
@@ -349,17 +430,19 @@ async def stream_agent_run(
         create_evidence(db, run, "final_response", "message", assistant_message.id, assistant_message.content, final_step)
         db.commit()
         yield sse_event("message_completed", {"message_id": assistant_message.id, "agent_run_id": run.id})
+    except asyncio.CancelledError:
+        _mark_run_interrupted(
+            db,
+            run,
+            assistant_message,
+            "CLIENT_DISCONNECTED",
+            "Client disconnected before the stream completed.",
+        )
+        db.commit()
+        raise
     except Exception as exc:
         code = getattr(exc, "code", "AGENT_RUN_FAILED")
-        assistant_message.status = "failed" if not assistant_message.content else "partial"
-        assistant_message.error_code = code
-        run.status = "failed" if not assistant_message.content else "partial"
-        run.error_code = code
-        run.completed_at = utcnow()
-        try:
-            create_step(db, run, "error", status_value="failed", output_summary=str(exc), error_code=code)
-        except AgentLoopLimitError:
-            pass
+        _mark_run_interrupted(db, run, assistant_message, code, str(exc))
         db.commit()
         yield sse_event(
             "error",
@@ -383,6 +466,7 @@ async def _run_calculator_path(
     run: AgentRun,
     expression: str,
 ) -> str:
+    _raise_if_run_expired(run)
     max_tool_calls = int((run.loop_limits_json or {}).get("max_tool_calls_per_run", 0))
     current_tool_calls = int(run.loop_counters_json.get("tool_calls", 0))
     if max_tool_calls and current_tool_calls >= max_tool_calls:
@@ -440,6 +524,7 @@ async def _run_model_path(
     assistant_message: Message,
     run: AgentRun,
 ) -> list[str]:
+    _raise_if_run_expired(run)
     model_step = create_step(db, run, "model_call", input_summary=user_message.content[:500])
     max_model_calls = int((run.loop_limits_json or {}).get("max_model_calls_per_run", 0))
     current_model_calls = int(run.loop_counters_json.get("model_calls", 0))
@@ -468,6 +553,7 @@ async def _run_model_path(
         ModelMessage(role="user", content=user_message.content),
     ]
     async for token in model_gateway.stream_chat(messages, model_name=agent.model_name, provider=agent.model_provider):
+        _raise_if_run_expired(run)
         if run.first_token_at is None:
             run.first_token_at = utcnow()
             model_request.first_token_at = run.first_token_at
